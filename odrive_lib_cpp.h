@@ -1,15 +1,6 @@
-/* odrive_lib_cpp.h - Control an ODrive (fw 0.6.x) over its ASCII serial
- * protocol, using SerialWorker for transport. Mirrors the API shape of
- * odrive_lib (the CAN version) where the transport allows; see the class
- * comments below for where ASCII's request/response, single-board model
- * forced a different shape (periodic messages, SDO, per-axis system ops).
- *
- * Non-blocking by design: every call here returns immediately (O(1) beyond
- * a short mutex hold -- no sleeping, no waiting for a serial reply). Getters
- * (request_encoder(), read_property(), ...) only *send* the request; the
- * result lands in `feedback` and fires its callback once Bus::poll() -- call
- * that once per iteration of your control loop -- dispatches the matching
- * reply. */
+/* Controls an ODrive (fw 0.6.x) over ASCII serial via SerialWorker. Every
+ * call is non-blocking; getters only send the request -- results land in
+ * `feedback` once Bus::poll() dispatches the reply. */
 #ifndef ODRIVE_LIB_CPP_H
 #define ODRIVE_LIB_CPP_H
 
@@ -33,7 +24,6 @@ enum class Status {
     ErrNotConnected
 };
 
-/* AxisState enum (ODrive fw 0.6.x). */
 enum class AxisState : uint8_t {
     Undefined                     = 0,
     Idle                          = 1,
@@ -92,10 +82,8 @@ enum class InputMode : uint8_t {
     Tuning       = 8
 };
 
-/* Host-side emulated "periodic message" kinds. ASCII has no cyclic broadcast
- * (that's a CAN-only concept: config.can.*_msg_rate_ms) -- set_msg_rate()
- * instead makes Bus::poll() call the matching request_*() on an interval and
- * fire the same callback, with no dedicated thread. */
+/* Emulated periodic messages -- ASCII has no CAN-style cyclic broadcast, so
+ * set_msg_rate() makes Bus::poll() request on an interval instead. */
 enum class MsgRate {
     Version = 0,
     Heartbeat,
@@ -142,10 +130,8 @@ struct Heartbeat {
     uint8_t  trajectory_done_flag = 0;
 };
 
-/* Updated field-by-field once Bus::poll() dispatches the reply to a
- * request_*()/poll_heartbeat()/read_property() call -- there is no
- * background feed keeping this fresh on its own unless you enable
- * set_msg_rate() for that field. */
+/* Fields only update once Bus::poll() dispatches a matching reply -- enable
+ * set_msg_rate() for a field to keep it fresh on its own. */
 struct Feedback {
     Heartbeat hb;
 
@@ -165,8 +151,7 @@ struct Feedback {
     uint32_t active_errors  = 0;
     uint32_t disarm_reason  = 0;
 
-    /* Last generic read_property() result (replaces the CAN version's raw
-     * TxSdo endpoint/value -- ASCII addresses properties by dotted name). */
+    /* Last generic read_property() result. */
     std::string last_property_path;
     std::string last_property_value;
 
@@ -174,22 +159,20 @@ struct Feedback {
     uint8_t fw_version_major = 0, fw_version_minor = 0, fw_version_revision = 0;
 };
 
-/* ---- human-readable strings ---- */
 const char *axis_state_str(uint8_t state);
 const char *procedure_result_str(uint8_t result);
 const char *control_mode_str(uint8_t mode);
 const char *input_mode_str(uint8_t mode);
-/* Format an error bitfield into buf as "NAME|NAME|0xHEX" (or "none").
- * Returns the number of chars that would be written (snprintf semantics). */
+
+/* Formats an error bitfield as "NAME|NAME|0xHEX" (or "none"); snprintf semantics. */
 int error_str(uint32_t err, char *buf, size_t buf_len);
-/* Format a whole heartbeat into buf, every field decoded to a name.
- * Returns the number of chars that would be written (snprintf semantics). */
+
+/* Formats a whole heartbeat, every field decoded to a name; snprintf semantics. */
 int heartbeat_str(const Heartbeat &hb, char *buf, size_t buf_len);
 
 /* ---- logger ---- */
 using LogFn = std::function<void(const std::string &)>;
-/* Attach the one log sink for the whole library. Call once at startup; pass
- * an empty std::function to detach. */
+/* Attaches the one log sink for the whole library; pass an empty fn to detach. */
 void attach_logger(LogFn fn);
 
 class Axis;
@@ -197,42 +180,27 @@ class Axis;
 using ReplyHandler = std::function<void(const std::string &line)>;
 using PropertyHandler = std::function<void(const std::string &value)>;
 
-/* One serial connection to one physical ODrive board. Axis instances for
- * axis0/axis1 on that board share a Bus, similar to how odrive_lib's CAN
- * ODrives on one bus share a send function. Owns nothing -- construct it
- * around a SerialWorker you set up, connect, and start() yourself.
- *
- * Not thread-safe against itself for poll() -- call poll() from a single
- * thread (typically your control loop). send_line()/request() may be called
- * from other threads concurrently; they only hold the mutex for the O(1)
- * enqueue+write, never for a wait. */
+/* One serial connection to an ODrive board; axis0/axis1 share it. Not
+ * thread-safe for poll() -- call it from a single thread. */
 class Bus {
 public:
     explicit Bus(SerialWorker &worker);
 
     /* Fire-and-forget: send one command line, no reply expected. O(1). */
     Status send_line(const std::string &line);
-    /* Send one command line and register on_reply to run against whatever
-     * reply line arrives next (matched FIFO -- the ASCII protocol replies in
-     * send order on one connection). Returns immediately; does not wait. */
+
+    /* Sends one line and matches the next reply to on_reply (FIFO order). */
     Status request(const std::string &line, ReplyHandler on_reply);
 
-    /* Call once per iteration of your control loop. Drains every reply line
-     * currently buffered by SerialWorker (O(lines buffered), normally 0 or
-     * 1), dispatches each to the oldest pending request(), drops any
-     * pending request that's gone unanswered past the reply timeout, and
-     * runs any Axis's due set_msg_rate() getters. Never sleeps or blocks. */
+    /* Call once per control-loop iteration: dispatches buffered replies,
+     * drops pending requests past the reply timeout, and runs due
+     * set_msg_rate() getters. Never sleeps or blocks. */
     void poll();
 
-    /* How long a request() may go unanswered before poll() silently drops
-     * it (default 200 ms), so one dropped/garbled byte can't wedge the
-     * pending queue forever. */
+    /* How long a request() may go unanswered before poll() drops it (default 200 ms). */
     void set_reply_timeout(int timeout_ms);
 
-    /* Device-wide system commands ("sc"/"ss"/"se"/"sr") -- the ASCII
-     * protocol has no per-axis clear-errors/save/erase/reboot, unlike CAN's
-     * per-node versions. Calling this from an Axis::clear_errors() etc.
-     * affects BOTH axes on the board. */
+    /* Device-wide system commands -- affect BOTH axes on the board. */
     Status clear_errors();
     Status save_config();
     Status erase_config();
@@ -261,9 +229,7 @@ private:
 
 using AxisCallback = std::function<void(Axis &)>;
 
-/* One axis (motor channel) on a Bus. Mirrors odrive_lib's odrive_t, with
- * `axis_index` (0/1, the ASCII protocol's "motor" argument) standing in for
- * CAN's node_id. */
+/* One axis (motor channel) on a Bus. */
 class Axis {
 public:
     Axis(Bus &bus, uint8_t axis_index, const std::string &name = "");
@@ -272,26 +238,22 @@ public:
     Axis(const Axis &) = delete;
     Axis &operator=(const Axis &) = delete;
 
-    /* turns_per_unit: motor turns per user unit (see odrive_lib's README for
-     * the full explanation) -- applies to position/velocity only. 0 is
-     * treated as 1.0. */
+    /* Motor turns per user unit; applies to position/velocity only. 0 == 1.0. */
     void set_conversion(float turns_per_unit, bool invert);
     void enable_logging(bool enable);
     uint8_t index() const { return axis_index_; }
 
-    /* ---- setpoints (fire-and-forget, O(1)) ---- */
+    /* ---- setpoints  ---- */
     Status set_input_pos(float pos, float vel_ff = 0.0f, float torque_ff = 0.0f);
     Status set_input_vel(float vel, float torque_ff = 0.0f);
     Status set_input_torque(float torque);
-    /* Best-effort: re-references the encoder over a generic property write.
-     * Verify the property path (see odrive_lib_cpp.cpp) against your fw. */
+    /* Best-effort: verify the property path (see odrive_lib_cpp.cpp) against your fw. */
     Status set_absolute_position(float pos);
-    /* Move delta relative to the last received encoder estimate. Returns
-     * Status::ErrBadArg until a request_encoder() reply has been dispatched
-     * by poll() at least once. */
+    /* Moves delta relative to the last received encoder estimate; ErrBadArg
+     * until a request_encoder() reply has been dispatched at least once. */
     Status set_relative_pos(float delta);
 
-    /* ---- control/config (fire-and-forget, O(1)) ---- */
+    /* ---- control/config---- */
     Status set_axis_state(AxisState state);
     Status set_closed_loop(bool enable);
     Status set_controller_mode(ControlMode control_mode, InputMode input_mode);
@@ -300,20 +262,15 @@ public:
     Status set_traj_accel_limits(float accel, float decel);
     Status set_defaults(float vel_limit, float accel, float decel);
     Status restore_defaults();
-    Status clear_errors();  /* forwards to Bus -- affects both axes, see Bus::clear_errors() */
-    /* Best-effort only: the ASCII protocol has no hard e-stop command. This
-     * requests AxisState::Idle, a controlled stop, not a true emergency
-     * stop. A real e-stop on ODrive is wired via a GPIO endstop input,
-     * outside this library's scope. */
+    Status clear_errors();  /* forwards to Bus -- affects both axes */
+    /* Best-effort: no hard e-stop over ASCII -- this just requests AxisState::Idle. */
     Status estop();
     Status reboot();       /* forwards to Bus -- affects both axes */
     Status save_config();  /* forwards to Bus -- affects both axes */
     Status erase_config(); /* forwards to Bus -- affects both axes */
 
-    /* ---- getters -- non-blocking: send the request and return immediately.
-     * `feedback` updates and the matching callback fires once Bus::poll()
-     * dispatches the reply (or replies -- some of these are two or more
-     * property reads under the hood, sent back-to-back without waiting). */
+    /* ---- getters -- send the request and return immediately; `feedback`
+     * and the matching callback update once Bus::poll() dispatches the reply. ---- */
     Status request_version();
     Status request_error();
     Status request_encoder();
@@ -322,21 +279,20 @@ public:
     Status request_bus_vi();
     Status request_torques();
     Status request_powers();
-    /* Emulates the CAN heartbeat: reads state/procedure_result/traj_done/
-     * active_errors and diffs+logs changed fields like odrive_lib does. */
     Status poll_heartbeat();
 
-    /* ---- generic property access (replaces raw SDO read/write) ---- */
+    /* ---- generic property access ---- */
     Status write_property(const std::string &path, const std::string &value);
-    /* Non-blocking: sends "r path", returns immediately. on_value (optional)
-     * runs with the raw reply once poll() dispatches it; `feedback.
-     * last_property_*` and on_property() always update/fire regardless. */
+
+    /* Non-blocking: sends "r path"; on_value (optional) runs with the raw
+     * reply once poll() dispatches it. */
     Status read_property(const std::string &path, PropertyHandler on_value = nullptr);
 
-    /* ---- host-side emulated periodic message rates (driven by Bus::poll(),
-     * no dedicated thread) ---- */
+    /* ---- host-side emulated periodic message rates ---- */
     Status set_msg_rate(MsgRate msg, uint32_t rate_ms);
-    Status set_all_msg_rates(const uint32_t rate_ms[static_cast<size_t>(MsgRate::Count)]);
+
+    /* Sets every MsgRate kind (Heartbeat, Encoder, Iq, ...) to the same rate_ms. */
+    Status set_all_msg_rates(uint32_t rate_ms);
 
     /* ---- callback registration ---- */
     void on_heartbeat(AxisCallback fn);
@@ -348,8 +304,9 @@ public:
     void on_powers(AxisCallback fn);
     void on_error(AxisCallback fn);
     void on_version(AxisCallback fn);
-    /* Fires after every dispatched read_property() reply (including the
-     * internal reads behind request_iq()/request_temperature()/etc). */
+    
+    /* Fires after every dispatched read_property() reply, including internal
+     * reads behind request_iq()/request_temperature()/etc. */
     void on_property(AxisCallback fn);
 
     Feedback feedback;
@@ -360,11 +317,9 @@ private:
 
     std::string prefix() const; /* "axis0." / "axis1." */
     void logf(const char *fmt, ...);
-    /* Sends "r " for each path immediately (no waiting between them); once
-     * every reply has been dispatched by Bus::poll(), calls combine with all
-     * values in path order (order-independent w.r.t. reply arrival order). */
+    /* Sends "r " for each path back-to-back; combine() runs once every
+     * reply has been dispatched, in path order regardless of arrival order. */
     Status request_many(std::vector<std::string> paths, PropertiesHandler combine);
-    /* Called by Bus::poll() for each due set_msg_rate() kind. */
     void poll_periodic(std::chrono::steady_clock::time_point now);
 
     Bus &bus_;

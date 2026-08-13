@@ -12,12 +12,8 @@ namespace odrive {
 
 namespace {
 
-/* Best-effort dotted property paths for ODrive fw 0.6.x, pulled from the
- * public API reference rather than verified against real hardware. Unlike
- * the CAN version's endpoint IDs these are not build-specific, but they can
- * still move across 0.6.x point releases -- if a getter below comes back
- * empty/wrong, check these against `odrivetool` (tab-complete on `odrv0.`)
- * or your board's documented property tree and fix the constant here. */
+/* Best-effort dotted property paths for fw 0.6.x -- verify against
+ * `odrivetool` (tab-complete on `odrv0.`) if a getter comes back wrong. */
 constexpr const char *kAbsPosProperty         = "pos_vel_mapper.pos_abs";
 constexpr const char *kIqSetpointProperty     = "motor.foc.Iq_setpoint";
 constexpr const char *kIqMeasuredProperty     = "motor.foc.Iq_measured";
@@ -479,10 +475,8 @@ Status Axis::read_property(const std::string &path, PropertyHandler on_value)
     });
 }
 
-/* Sends one "r <path>" per entry back-to-back (no waiting between them);
- * `combine` runs once every reply has been dispatched by Bus::poll(),
- * regardless of the order they actually arrive in (each lands in its own
- * slot by index, not by arrival order). */
+/* Sends one "r <path>" per entry back-to-back; combine runs once every
+ * reply is dispatched, in path order regardless of arrival order. */
 Status Axis::request_many(std::vector<std::string> paths, PropertiesHandler combine)
 {
     auto count = paths.size();
@@ -647,10 +641,10 @@ Status Axis::set_msg_rate(MsgRate msg, uint32_t rate_ms)
     return Status::Ok;
 }
 
-Status Axis::set_all_msg_rates(const uint32_t rate_ms[static_cast<size_t>(MsgRate::Count)])
+Status Axis::set_all_msg_rates(uint32_t rate_ms)
 {
-    logf("set_all_msg_rates");
-    for (size_t i = 0; i < static_cast<size_t>(MsgRate::Count); ++i) msg_rate_ms_[i] = rate_ms[i];
+    logf("set_all_msg_rates=%u ms", (unsigned)rate_ms);
+    msg_rate_ms_.fill(rate_ms);
     return Status::Ok;
 }
 
