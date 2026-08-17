@@ -247,7 +247,6 @@ public:
     Status set_input_pos(float pos, float vel_ff = 0.0f, float torque_ff = 0.0f);
     Status set_input_vel(float vel, float torque_ff = 0.0f);
     Status set_input_torque(float torque);
-    /* Best-effort: verify the property path (see odrive_lib_cpp.cpp) against your fw. */
     Status set_absolute_position(float pos);
     /* Moves delta relative to the last received encoder estimate; ErrBadArg
      * until a request_encoder() reply has been dispatched at least once. */

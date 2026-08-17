@@ -14,7 +14,6 @@ namespace {
 
 /* Best-effort dotted property paths for fw 0.6.x -- verify against
  * `odrivetool` (tab-complete on `odrv0.`) if a getter comes back wrong. */
-constexpr const char *kAbsPosProperty         = "pos_vel_mapper.pos_abs";
 constexpr const char *kIqSetpointProperty     = "motor.foc.Iq_setpoint";
 constexpr const char *kIqMeasuredProperty     = "motor.foc.Iq_measured";
 constexpr const char *kFetTempProperty        = "motor.fet_thermistor.temperature";
@@ -257,7 +256,7 @@ void Bus::poll()
         while (!pending_.empty() &&
                now - pending_.front().issued_at > std::chrono::milliseconds(reply_timeout_ms_)) {
             pending_.pop_front();
-            if (log_sink()) log_sink()("bus: dropped stale pending reply (no response within timeout)");
+            // if (log_sink()) log_sink()("bus: dropped stale pending reply (no response within timeout)");
         }
     }
 
@@ -352,7 +351,9 @@ Status Axis::set_input_torque(float torque)
 Status Axis::set_absolute_position(float pos)
 {
     logf("absolute_position %.3f", pos);
-    return write_property(prefix() + kAbsPosProperty, format_float(pos * turns_per_unit_));
+    return write_property(prefix() + "pos_estimate ",
+                           format_float(pos));
+    // return bus_.send_line(build_cmd("es", axis_index_, { pos }));
 }
 
 Status Axis::set_relative_pos(float delta)
@@ -401,16 +402,16 @@ Status Axis::set_limits(float vel_limit, float current_limit)
 Status Axis::set_traj_vel_limit(float vel_limit)
 {
     logf("traj_vel_limit %.3f", vel_limit);
-    return write_property(prefix() + "controller.config.traj_vel_limit",
+    return write_property(prefix() + "trap_traj.config.vel_limit ",
                            format_float(std::fabs(vel_limit * turns_per_unit_)));
 }
 
 Status Axis::set_traj_accel_limits(float accel, float decel)
 {
     logf("traj_accel_limits accel=%.3f decel=%.3f", accel, decel);
-    Status s1 = write_property(prefix() + "controller.config.traj_accel_limit",
+    Status s1 = write_property(prefix() + "trap_traj.config.accel_limit",
                                 format_float(std::fabs(accel * turns_per_unit_)));
-    Status s2 = write_property(prefix() + "controller.config.traj_decel_limit",
+    Status s2 = write_property(prefix() + "trap_traj.config.decel_limit",
                                 format_float(std::fabs(decel * turns_per_unit_)));
     return (s1 != Status::Ok) ? s1 : s2;
 }
@@ -602,7 +603,8 @@ Status Axis::poll_heartbeat()
                 std::string msg;
                 if (n_st != feedback.hb.axis_state) {
                     msg += (msg.empty() ? "" : " ");
-                    msg += "axis_state=" + std::string(axis_state_str(n_st)) + "(" + std::to_string(n_st) + ")";
+                    msg += "axis_state changed: " + std::string(axis_state_str(feedback.hb.axis_state))
+                         + " -> " + std::string(axis_state_str(n_st));
                 }
                 if (n_proc != feedback.hb.procedure_result) {
                     msg += (msg.empty() ? "" : " ");
