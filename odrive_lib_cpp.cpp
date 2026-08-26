@@ -38,25 +38,6 @@ std::string format_float(float v)
     return buf;
 }
 
-/* Strict unsigned parse: the whole token must be one integer (trailing CR/LF
- * and spaces allowed). Rejects "151.4 19.99" -- an encoder reply that landed
- * on the wrong handler -- which strtoul() alone would silently read as 151. */
-bool parse_u32_strict(const std::string &s, uint32_t &out)
-{
-    const char *p = s.c_str();
-    while (*p == ' ' || *p == '\t') ++p;
-    if (*p == '\0') return false;
-
-    char *end = nullptr;
-    unsigned long v = std::strtoul(p, &end, 0);
-    if (end == p) return false;
-    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
-    if (*end != '\0') return false;
-
-    out = (uint32_t)v;
-    return true;
-}
-
 std::string build_cmd(const char *letter, uint8_t axis, std::initializer_list<float> args)
 {
     std::string s = std::string(letter) + " " + std::to_string(axis);
@@ -222,6 +203,50 @@ void attach_logger(LogFn fn)
     log_sink() = std::move(fn);
 }
 
+/* ---- strict reply parsing ----
+ * The transport guarantees a reply is matched to the right request, but not
+ * that the line is well-formed (line noise, firmware error text). A reply
+ * that does not parse cleanly -- whole string consumed, nothing left over --
+ * must never be stored into `feedback`, where it would masquerade as a valid
+ * value (strtoul("invalid property") == 0 == AxisState::Undefined). */
+
+static bool parse_u32_strict(const std::string &s, uint32_t &out)
+{
+    const char *p = s.c_str();
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') return false;
+    char *end = nullptr;
+    unsigned long v = std::strtoul(p, &end, 0);
+    if (end == p) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r') ++end;
+    if (*end != '\0') return false;
+    out = (uint32_t)v;
+    return true;
+}
+
+static bool parse_f32_strict(const std::string &s, float &out)
+{
+    const char *p = s.c_str();
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') return false;
+    char *end = nullptr;
+    float v = std::strtof(p, &end);
+    if (end == p) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r') ++end;
+    if (*end != '\0') return false;
+    out = v;
+    return true;
+}
+
+static bool parse_bool_strict(const std::string &s, uint8_t &out)
+{
+    if (s == "1" || s == "true")  { out = 1; return true; }
+    if (s == "0" || s == "false") { out = 0; return true; }
+    uint32_t v;
+    if (parse_u32_strict(s, v) && v <= 1) { out = (uint8_t)v; return true; }
+    return false;
+}
+
 /* ---- Bus ---- */
 
 Bus::Bus(SerialWorker &worker) : worker_(worker)
@@ -244,94 +269,138 @@ Status Bus::send_line(const std::string &line)
 
 Status Bus::request(const std::string &line, ReplyHandler on_reply)
 {
-    Status s;
-    std::string msg; /* built under the lock, logged after releasing it */
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!worker_.isOpen()) return Status::ErrNotConnected;
 
-        /* Sending during a resync would produce the very replies we are trying
-         * to drain past, so the resync could never finish. Skip this sample --
-         * every caller is a periodic getter that will come round again. */
-        if (resyncing_) return Status::ErrResyncing;
-
-        if (pending_.size() >= max_pending_) {
-            pending_.clear();
-            resyncing_ = true;
-            resync_quiet_since_ = std::chrono::steady_clock::now();
-            msg = "bus: pending queue hit " + std::to_string(max_pending_) +
-                  " unanswered requests -- resyncing";
-            s = Status::ErrResyncing;
-        } else {
-            s = send_line_locked(line);
-            if (s == Status::Ok)
-                pending_.push_back({ std::move(on_reply), std::chrono::steady_clock::now() });
+    if (queue_.size() >= max_queued_) {
+        /* Backpressure should make this unreachable; if it trips, keep the
+         * newest requests (freshest data) and report it, throttled. */
+        queue_.pop_front();
+        ++dropped_since_log_;
+        auto now = std::chrono::steady_clock::now();
+        if (log_sink() && now >= next_drop_log_) {
+            log_sink()("bus: request queue overflow -- dropped " +
+                       std::to_string(dropped_since_log_) + " oldest request(s)");
+            dropped_since_log_ = 0;
+            next_drop_log_ = now + std::chrono::seconds(1);
         }
     }
-    if (!msg.empty() && log_sink()) log_sink()(msg.c_str());
-    return s;
+    queue_.push_back({ line, std::move(on_reply) });
+    pump_locked(std::chrono::steady_clock::now());
+    return Status::Ok;
 }
 
 void Bus::set_reply_timeout(int timeout_ms) { reply_timeout_ms_ = timeout_ms; }
+void Bus::set_max_retries(int retries)      { max_retries_ = retries < 0 ? 0 : retries; }
 
-bool Bus::is_resyncing() const
+size_t Bus::queued()
 {
     std::lock_guard<std::mutex> lock(mutex_);
-    return resyncing_;
+    return queue_.size();
+}
+
+void Bus::pump_locked(std::chrono::steady_clock::time_point now)
+{
+    if (in_flight_ || queue_.empty() || now < quiet_until_) return;
+    if (send_line_locked(queue_.front().line) != Status::Ok) return; /* port closed; keep queued */
+
+    flight_line_ = std::move(queue_.front().line);
+    flight_handler_ = std::move(queue_.front().handler);
+    queue_.pop_front();
+    flight_retries_ = 0;
+    flight_issued_at_ = now;
+    in_flight_ = true;
 }
 
 void Bus::poll()
 {
-    size_t lines_seen = 0;
+    auto now = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bool open = worker_.isOpen();
+        if (open && !was_open_) {
+            /* Fresh connection: the RX stream may start mid-line or hold
+             * output from before the drop. Abandon anything from the old
+             * link and let the junk drain while nothing is in flight. */
+            in_flight_ = false;
+            flight_handler_ = nullptr;
+            quiet_until_ = now + std::chrono::milliseconds(reply_timeout_ms_);
+            if (log_sink()) log_sink()("bus: port opened -- draining link before first request");
+        }
+        was_open_ = open;
+    }
+
     for (;;) {
         std::string line = worker_.get_data();
         if (line.empty()) break;
-        ++lines_seen;
 
         ReplyHandler handler;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (resyncing_) continue;      /* straggler from a dropped request */
-            if (pending_.empty()) continue; /* unsolicited line; discard */
-            handler = std::move(pending_.front().handler);
-            pending_.pop_front();
-        }
-        if (handler) handler(line);
-    }
-
-    auto now = std::chrono::steady_clock::now();
-    std::string msg; /* built under the lock, logged after releasing it */
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-
-        /* Nothing new is sent while resyncing, so once the port has stayed
-         * quiet for resync_quiet_ms_ every straggler has been drained and the
-         * next reply is guaranteed to belong to the next request. */
-        if (resyncing_) {
-            if (lines_seen > 0) {
-                resync_quiet_since_ = now;
-            } else if (now - resync_quiet_since_ >= std::chrono::milliseconds(resync_quiet_ms_)) {
-                resyncing_ = false;
-                msg = "bus: resynced";
+            if (!in_flight_) {
+                /* Nothing outstanding: boot text, or the duplicate reply of a
+                 * retried request. With one request in flight at a time this
+                 * can never belong to anyone -- discard it. */
+                if (log_sink())
+                    log_sink()("bus: stray line discarded: '" + line.substr(0, 64) + "'");
+                continue;
+            }
+            handler = std::move(flight_handler_);
+            flight_handler_ = nullptr;
+            in_flight_ = false;
+            if (flight_retries_ > 0) {
+                /* Both the original and the resend may have been answered;
+                 * hold the wire so the second copy lands while idle. */
+                quiet_until_ = std::chrono::steady_clock::now() +
+                               std::chrono::milliseconds(reply_timeout_ms_);
             }
         }
+        if (handler) handler(line);
 
-        /* One unanswered request shifts every later reply onto the wrong
-         * handler, so the queue as a whole is no longer trustworthy -- drop it
-         * all and realign rather than dispatch mis-paired values. */
-        if (!resyncing_ && !pending_.empty() &&
-            now - pending_.front().issued_at > std::chrono::milliseconds(reply_timeout_ms_)) {
-            msg = "bus: no reply within " + std::to_string(reply_timeout_ms_) + " ms -- dropped " +
-                  std::to_string(pending_.size()) + " pending request(s), resyncing";
-            pending_.clear();
-            resyncing_ = true;
-            resync_quiet_since_ = now;
-        }
+        /* Send the next request in the same iteration -- the wire never
+         * sits idle while work is queued. */
+        std::lock_guard<std::mutex> lock(mutex_);
+        pump_locked(std::chrono::steady_clock::now());
     }
-    if (!msg.empty() && log_sink()) log_sink()(msg.c_str());
+
+    now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (in_flight_ &&
+            now - flight_issued_at_ > std::chrono::milliseconds(reply_timeout_ms_)) {
+            if (flight_retries_ < max_retries_ && worker_.isOpen()) {
+                /* Resend the SAME line: if the original reply is merely late,
+                 * it still answers this request correctly. */
+                ++flight_retries_;
+                flight_issued_at_ = now;
+                send_line_locked(flight_line_);
+                if (log_sink()) {
+                    log_sink()("bus: no reply in " + std::to_string(reply_timeout_ms_) +
+                               " ms -- resent (retry " + std::to_string(flight_retries_) +
+                               "/" + std::to_string(max_retries_) + "): '" + flight_line_ + "'");
+                }
+            } else {
+                /* The datum is unobtainable; its handler never runs. Hold the
+                 * wire so an ultra-late reply is discarded as a stray. */
+                in_flight_ = false;
+                flight_handler_ = nullptr;
+                quiet_until_ = now + std::chrono::milliseconds(reply_timeout_ms_);
+                if (log_sink())
+                    log_sink()("bus: abandoned after " + std::to_string(flight_retries_) +
+                               " retries: '" + flight_line_ + "'");
+            }
+        }
+        pump_locked(now);
+    }
 
     std::vector<Axis *> axes_copy;
     {
         std::lock_guard<std::mutex> lock(mutex_);
+        /* Backpressure: while the link is behind, adding due getters would
+         * only queue reads that are stale by the time they are sent. Their
+         * next_due_ stays in the past; they fire as soon as this drains. */
+        if (queue_.size() >= periodic_high_water_) return;
         axes_copy = axes_;
     }
     for (Axis *axis : axes_copy) axis->poll_periodic(now);
@@ -587,8 +656,13 @@ Status Axis::request_iq()
 {
     return request_many({ prefix() + kIqSetpointProperty, prefix() + kIqMeasuredProperty },
         [this](const std::vector<std::string> &v) {
-            feedback.iq_setpoint = std::strtof(v[0].c_str(), nullptr);
-            feedback.iq_measured = std::strtof(v[1].c_str(), nullptr);
+            float setp, meas;
+            if (!parse_f32_strict(v[0], setp) || !parse_f32_strict(v[1], meas)) {
+                logf("iq: unparseable reply ('%s','%s') -- update skipped", v[0].c_str(), v[1].c_str());
+                return;
+            }
+            feedback.iq_setpoint = setp;
+            feedback.iq_measured = meas;
             if (cb_iq_) cb_iq_(*this);
         });
 }
@@ -597,8 +671,13 @@ Status Axis::request_temperature()
 {
     return request_many({ prefix() + kFetTempProperty, prefix() + kMotorTempProperty },
         [this](const std::vector<std::string> &v) {
-            feedback.fet_temperature = std::strtof(v[0].c_str(), nullptr);
-            feedback.motor_temperature = std::strtof(v[1].c_str(), nullptr);
+            float fet, mot;
+            if (!parse_f32_strict(v[0], fet) || !parse_f32_strict(v[1], mot)) {
+                logf("temperature: unparseable reply ('%s','%s') -- update skipped", v[0].c_str(), v[1].c_str());
+                return;
+            }
+            feedback.fet_temperature = fet;
+            feedback.motor_temperature = mot;
             if (cb_temperature_) cb_temperature_(*this);
         });
 }
@@ -607,8 +686,13 @@ Status Axis::request_bus_vi()
 {
     return request_many({ kVbusVoltageProperty, kIbusProperty },
         [this](const std::vector<std::string> &v) {
-            feedback.bus_voltage = std::strtof(v[0].c_str(), nullptr);
-            feedback.bus_current = std::strtof(v[1].c_str(), nullptr);
+            float volt, curr;
+            if (!parse_f32_strict(v[0], volt) || !parse_f32_strict(v[1], curr)) {
+                logf("bus_vi: unparseable reply ('%s','%s') -- update skipped", v[0].c_str(), v[1].c_str());
+                return;
+            }
+            feedback.bus_voltage = volt;
+            feedback.bus_current = curr;
             if (cb_bus_vi_) cb_bus_vi_(*this);
         });
 }
@@ -617,8 +701,13 @@ Status Axis::request_torques()
 {
     return request_many({ prefix() + kTorqueSetpointProperty, prefix() + kTorqueEstimateProperty },
         [this](const std::vector<std::string> &v) {
-            feedback.torque_target = std::strtof(v[0].c_str(), nullptr);
-            feedback.torque_estimate = std::strtof(v[1].c_str(), nullptr);
+            float target, est;
+            if (!parse_f32_strict(v[0], target) || !parse_f32_strict(v[1], est)) {
+                logf("torques: unparseable reply ('%s','%s') -- update skipped", v[0].c_str(), v[1].c_str());
+                return;
+            }
+            feedback.torque_target = target;
+            feedback.torque_estimate = est;
             if (cb_torques_) cb_torques_(*this);
         });
 }
@@ -627,8 +716,13 @@ Status Axis::request_powers()
 {
     return request_many({ prefix() + kElectricalPowerProperty, prefix() + kMechanicalPowerProperty },
         [this](const std::vector<std::string> &v) {
-            feedback.electrical_power = std::strtof(v[0].c_str(), nullptr);
-            feedback.mechanical_power = std::strtof(v[1].c_str(), nullptr);
+            float elec, mech;
+            if (!parse_f32_strict(v[0], elec) || !parse_f32_strict(v[1], mech)) {
+                logf("powers: unparseable reply ('%s','%s') -- update skipped", v[0].c_str(), v[1].c_str());
+                return;
+            }
+            feedback.electrical_power = elec;
+            feedback.mechanical_power = mech;
             if (cb_powers_) cb_powers_(*this);
         });
 }
@@ -637,8 +731,13 @@ Status Axis::request_error()
 {
     return request_many({ prefix() + "active_errors", prefix() + "disarm_reason" },
         [this](const std::vector<std::string> &v) {
-            feedback.active_errors = (uint32_t)std::strtoul(v[0].c_str(), nullptr, 0);
-            feedback.disarm_reason = (uint32_t)std::strtoul(v[1].c_str(), nullptr, 0);
+            uint32_t act, dis;
+            if (!parse_u32_strict(v[0], act) || !parse_u32_strict(v[1], dis)) {
+                logf("error: unparseable reply ('%s','%s') -- update skipped", v[0].c_str(), v[1].c_str());
+                return;
+            }
+            feedback.active_errors = act;
+            feedback.disarm_reason = dis;
             if (cb_error_) cb_error_(*this);
         });
 }
@@ -663,34 +762,17 @@ Status Axis::poll_heartbeat()
     return request_many({ prefix() + "current_state", prefix() + "procedure_result",
                            prefix() + "controller.trajectory_done", prefix() + "active_errors" },
         [this](const std::vector<std::string> &v) {
-            /* Guard against a reply that landed on the wrong handler: state and
-             * procedure_result are small enums, so anything else means the bus
-             * is mis-paired (Bus::poll() resyncs) and this sample is not ours. */
-            uint32_t r_st = 0, r_proc = 0, r_err = 0;
-            const bool plausible =
-                parse_u32_strict(v[0], r_st) && r_st <= (uint32_t)AxisState::HarmonicCalibCommutation &&
-                parse_u32_strict(v[1], r_proc) && r_proc <= (uint32_t)ProcedureResult::RequestedCurrentTooHigh &&
-                parse_u32_strict(v[3], r_err);
-            if (!plausible) {
-                ++hb_rejected_;
-                if (!hb_rejecting_) {
-                    hb_rejecting_ = true;
-                    logf("heartbeat: implausible reply (state=\"%s\" proc=\"%s\" err=\"%s\") -- "
-                         "dropping samples until the bus realigns",
-                         v[0].c_str(), v[1].c_str(), v[3].c_str());
-                }
+            uint32_t st32, proc32, n_err;
+            uint8_t n_traj;
+            if (!parse_u32_strict(v[0], st32) || !parse_u32_strict(v[1], proc32) ||
+                !parse_bool_strict(v[2], n_traj) || !parse_u32_strict(v[3], n_err) ||
+                st32 > 0xFFu || proc32 > 0xFFu) {
+                logf("heartbeat: unparseable reply ('%s','%s','%s','%s') -- update skipped",
+                     v[0].c_str(), v[1].c_str(), v[2].c_str(), v[3].c_str());
                 return;
             }
-            if (hb_rejecting_) {
-                hb_rejecting_ = false;
-                logf("heartbeat: readings plausible again (%u sample(s) dropped)", (unsigned)hb_rejected_);
-                hb_rejected_ = 0;
-            }
-
-            uint8_t n_st = (uint8_t)r_st;
-            uint8_t n_proc = (uint8_t)r_proc;
-            uint8_t n_traj = (v[2] == "1" || v[2] == "true") ? 1u : 0u;
-            uint32_t n_err = r_err;
+            uint8_t n_st = (uint8_t)st32;
+            uint8_t n_proc = (uint8_t)proc32;
 
             if (log_sink() && log_enabled_) {
                 std::string msg;

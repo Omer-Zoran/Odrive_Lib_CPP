@@ -21,8 +21,7 @@ namespace odrive {
 enum class Status {
     Ok = 0,
     ErrBadArg,
-    ErrNotConnected,
-    ErrResyncing /* request refused: bus is realigning replies, retry next poll */
+    ErrNotConnected
 };
 
 enum class AxisState : uint8_t {
@@ -190,21 +189,27 @@ public:
     /* Fire-and-forget: send one command line, no reply expected. O(1). */
     Status send_line(const std::string &line);
 
-    /* Sends one line and matches the next reply to on_reply (FIFO order).
-     * Returns ErrResyncing (without sending) while the bus is realigning. */
+    /* Queues one line; on_reply runs with its reply. Replies carry no request
+     * id, so exactly one request is on the wire at a time and the rest wait
+     * here -- poll() drains the queue in FIFO order. Fire-and-forget commands
+     * (send_line) are NOT queued and go out immediately. */
     Status request(const std::string &line, ReplyHandler on_reply);
 
     /* Call once per control-loop iteration: dispatches buffered replies,
-     * drops pending requests past the reply timeout, and runs due
+     * pumps the request queue, retries unanswered requests, and runs due
      * set_msg_rate() getters. Never sleeps or blocks. */
     void poll();
 
-    /* How long a request() may go unanswered before poll() drops it (default 200 ms). */
+    /* How long the in-flight request may go unanswered before poll() resends
+     * it (default 250 ms). A request is resent up to set_max_retries() times,
+     * then abandoned with a log message. */
     void set_reply_timeout(int timeout_ms);
 
-    /* True while poll() is discarding lines to realign replies with requests.
-     * Clears itself on the first poll() pass that sees no incoming data. */
-    bool is_resyncing() const;
+    /* Resend attempts for an unanswered request before giving up (default 2). */
+    void set_max_retries(int retries);
+
+    /* Requests waiting for the wire, excluding the one in flight. */
+    size_t queued();
 
     /* Device-wide system commands -- affect BOTH axes on the board. */
     Status clear_errors();
@@ -219,27 +224,57 @@ private:
     void register_axis(Axis *axis);
     void unregister_axis(Axis *axis);
 
-    struct Pending {
+    struct Outbound {
+        std::string line;
         ReplyHandler handler;
-        std::chrono::steady_clock::time_point issued_at;
     };
 
     Status send_line_locked(const std::string &line);
+    /* Puts the next queued request on the wire when the link is free.
+     * Call with mutex_ held. */
+    void pump_locked(std::chrono::steady_clock::time_point now);
 
     SerialWorker &worker_;
-    mutable std::mutex mutex_; /* guards worker_ writes + pending_ + axes_ + resync state */
-    std::deque<Pending> pending_;
-    std::vector<Axis *> axes_;
-    int reply_timeout_ms_ = 200;
+    std::mutex mutex_; /* guards worker_ writes + all transport state + axes_ */
 
-    /* ASCII replies carry no request tag, so pairing is positional: one lost
-     * or unsolicited line would mis-pair every later reply, permanently.
-     * A dropped reply therefore invalidates the whole queue -- clear it and
-     * swallow inbound lines until the port goes quiet, which re-aligns. */
-    bool resyncing_ = false;
-    std::chrono::steady_clock::time_point resync_quiet_since_{};
-    int resync_quiet_ms_ = 50; /* silence that proves nothing is still in flight */
-    size_t max_pending_ = 32;  /* backstop: replies not coming back at all */
+    /* ASCII replies carry no request id: a reply can only be matched to a
+     * request by arrival order. With several requests outstanding, one lost,
+     * late, or extra line silently misattributes every later reply to the
+     * wrong field -- permanently. So exactly ONE request is in flight at a
+     * time; a reply is then unambiguous even when it arrives late. */
+    std::deque<Outbound> queue_;
+    bool in_flight_ = false;
+    ReplyHandler flight_handler_;
+    std::string flight_line_;
+    int flight_retries_ = 0;
+    std::chrono::steady_clock::time_point flight_issued_at_{};
+
+    /* An unanswered request is resent -- the resend is the same line, so even
+     * the original reply arriving late still answers it correctly. Only after
+     * max_retries_ resends is it abandoned (the datum is unobtainable). */
+    int reply_timeout_ms_ = 250;
+    int max_retries_ = 2;
+
+    /* After an abandon, port (re)open, or a retried request completing, the
+     * wire must stay silent this long before the next send: a straggling
+     * duplicate reply then lands while nothing is in flight and is discarded
+     * instead of answering the wrong request. */
+    std::chrono::steady_clock::time_point quiet_until_{};
+    bool was_open_ = false;
+
+    /* Backpressure: poll() holds due set_msg_rate() getters while this many
+     * requests still wait, so periodic rates degrade to what the link can
+     * actually sustain instead of queueing reads that are stale on arrival.
+     * Nothing is dropped -- next_due_ stays in the past and the getter fires
+     * the moment the queue drains. */
+    size_t periodic_high_water_ = 2;
+
+    /* Hard backstop only -- backpressure keeps the queue near-empty. */
+    size_t max_queued_ = 256;
+    size_t dropped_since_log_ = 0;
+    std::chrono::steady_clock::time_point next_drop_log_{};
+
+    std::vector<Axis *> axes_;
 };
 
 using AxisCallback = std::function<void(Axis &)>;
@@ -344,10 +379,6 @@ private:
     float turns_per_unit_ = 1.0f; /* signed: motor turns per user unit + inversion */
     bool pos_valid_ = false;      /* set once a request_encoder() reply is dispatched */
 
-    /* Heartbeat samples that failed the plausibility check (mis-paired reply);
-     * edge-logged so a desync reports twice, not once per poll. */
-    bool hb_rejecting_ = false;
-    uint32_t hb_rejected_ = 0;
 
     float default_vel_limit_ = 0.0f;
     float default_accel_     = 0.0f;
