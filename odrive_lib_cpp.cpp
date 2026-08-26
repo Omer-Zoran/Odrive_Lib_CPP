@@ -38,6 +38,25 @@ std::string format_float(float v)
     return buf;
 }
 
+/* Strict unsigned parse: the whole token must be one integer (trailing CR/LF
+ * and spaces allowed). Rejects "151.4 19.99" -- an encoder reply that landed
+ * on the wrong handler -- which strtoul() alone would silently read as 151. */
+bool parse_u32_strict(const std::string &s, uint32_t &out)
+{
+    const char *p = s.c_str();
+    while (*p == ' ' || *p == '\t') ++p;
+    if (*p == '\0') return false;
+
+    char *end = nullptr;
+    unsigned long v = std::strtoul(p, &end, 0);
+    if (end == p) return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') ++end;
+    if (*end != '\0') return false;
+
+    out = (uint32_t)v;
+    return true;
+}
+
 std::string build_cmd(const char *letter, uint8_t axis, std::initializer_list<float> args)
 {
     std::string s = std::string(letter) + " " + std::to_string(axis);
@@ -225,24 +244,53 @@ Status Bus::send_line(const std::string &line)
 
 Status Bus::request(const std::string &line, ReplyHandler on_reply)
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    Status s = send_line_locked(line);
-    if (s != Status::Ok) return s;
-    pending_.push_back({ std::move(on_reply), std::chrono::steady_clock::now() });
-    return Status::Ok;
+    Status s;
+    std::string msg; /* built under the lock, logged after releasing it */
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+
+        /* Sending during a resync would produce the very replies we are trying
+         * to drain past, so the resync could never finish. Skip this sample --
+         * every caller is a periodic getter that will come round again. */
+        if (resyncing_) return Status::ErrResyncing;
+
+        if (pending_.size() >= max_pending_) {
+            pending_.clear();
+            resyncing_ = true;
+            resync_quiet_since_ = std::chrono::steady_clock::now();
+            msg = "bus: pending queue hit " + std::to_string(max_pending_) +
+                  " unanswered requests -- resyncing";
+            s = Status::ErrResyncing;
+        } else {
+            s = send_line_locked(line);
+            if (s == Status::Ok)
+                pending_.push_back({ std::move(on_reply), std::chrono::steady_clock::now() });
+        }
+    }
+    if (!msg.empty() && log_sink()) log_sink()(msg.c_str());
+    return s;
 }
 
 void Bus::set_reply_timeout(int timeout_ms) { reply_timeout_ms_ = timeout_ms; }
 
+bool Bus::is_resyncing() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return resyncing_;
+}
+
 void Bus::poll()
 {
+    size_t lines_seen = 0;
     for (;;) {
         std::string line = worker_.get_data();
         if (line.empty()) break;
+        ++lines_seen;
 
         ReplyHandler handler;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (resyncing_) continue;      /* straggler from a dropped request */
             if (pending_.empty()) continue; /* unsolicited line; discard */
             handler = std::move(pending_.front().handler);
             pending_.pop_front();
@@ -251,14 +299,35 @@ void Bus::poll()
     }
 
     auto now = std::chrono::steady_clock::now();
+    std::string msg; /* built under the lock, logged after releasing it */
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        while (!pending_.empty() &&
-               now - pending_.front().issued_at > std::chrono::milliseconds(reply_timeout_ms_)) {
-            pending_.pop_front();
-            // if (log_sink()) log_sink()("bus: dropped stale pending reply (no response within timeout)");
+
+        /* Nothing new is sent while resyncing, so once the port has stayed
+         * quiet for resync_quiet_ms_ every straggler has been drained and the
+         * next reply is guaranteed to belong to the next request. */
+        if (resyncing_) {
+            if (lines_seen > 0) {
+                resync_quiet_since_ = now;
+            } else if (now - resync_quiet_since_ >= std::chrono::milliseconds(resync_quiet_ms_)) {
+                resyncing_ = false;
+                msg = "bus: resynced";
+            }
+        }
+
+        /* One unanswered request shifts every later reply onto the wrong
+         * handler, so the queue as a whole is no longer trustworthy -- drop it
+         * all and realign rather than dispatch mis-paired values. */
+        if (!resyncing_ && !pending_.empty() &&
+            now - pending_.front().issued_at > std::chrono::milliseconds(reply_timeout_ms_)) {
+            msg = "bus: no reply within " + std::to_string(reply_timeout_ms_) + " ms -- dropped " +
+                  std::to_string(pending_.size()) + " pending request(s), resyncing";
+            pending_.clear();
+            resyncing_ = true;
+            resync_quiet_since_ = now;
         }
     }
+    if (!msg.empty() && log_sink()) log_sink()(msg.c_str());
 
     std::vector<Axis *> axes_copy;
     {
@@ -338,7 +407,7 @@ Status Axis::set_input_pos(float pos, float vel_ff, float torque_ff)
 
 Status Axis::set_input_vel(float vel, float torque_ff)
 {
-    logf("input_vel %.3f (tff=%.3f)", vel, torque_ff);
+    // logf("input_vel %.3f (tff=%.3f)", vel, torque_ff);
     return bus_.send_line(build_cmd("v", axis_index_, { vel * turns_per_unit_, torque_ff }));
 }
 
@@ -402,7 +471,7 @@ Status Axis::set_limits(float vel_limit, float current_limit)
 Status Axis::set_traj_vel_limit(float vel_limit)
 {
     logf("traj_vel_limit %.3f", vel_limit);
-    return write_property(prefix() + "trap_traj.config.vel_limit ",
+    return write_property(prefix() + "trap_traj.config.vel_limit",
                            format_float(std::fabs(vel_limit * turns_per_unit_)));
 }
 
@@ -594,10 +663,34 @@ Status Axis::poll_heartbeat()
     return request_many({ prefix() + "current_state", prefix() + "procedure_result",
                            prefix() + "controller.trajectory_done", prefix() + "active_errors" },
         [this](const std::vector<std::string> &v) {
-            uint8_t n_st = (uint8_t)std::strtoul(v[0].c_str(), nullptr, 0);
-            uint8_t n_proc = (uint8_t)std::strtoul(v[1].c_str(), nullptr, 0);
+            /* Guard against a reply that landed on the wrong handler: state and
+             * procedure_result are small enums, so anything else means the bus
+             * is mis-paired (Bus::poll() resyncs) and this sample is not ours. */
+            uint32_t r_st = 0, r_proc = 0, r_err = 0;
+            const bool plausible =
+                parse_u32_strict(v[0], r_st) && r_st <= (uint32_t)AxisState::HarmonicCalibCommutation &&
+                parse_u32_strict(v[1], r_proc) && r_proc <= (uint32_t)ProcedureResult::RequestedCurrentTooHigh &&
+                parse_u32_strict(v[3], r_err);
+            if (!plausible) {
+                ++hb_rejected_;
+                if (!hb_rejecting_) {
+                    hb_rejecting_ = true;
+                    logf("heartbeat: implausible reply (state=\"%s\" proc=\"%s\" err=\"%s\") -- "
+                         "dropping samples until the bus realigns",
+                         v[0].c_str(), v[1].c_str(), v[3].c_str());
+                }
+                return;
+            }
+            if (hb_rejecting_) {
+                hb_rejecting_ = false;
+                logf("heartbeat: readings plausible again (%u sample(s) dropped)", (unsigned)hb_rejected_);
+                hb_rejected_ = 0;
+            }
+
+            uint8_t n_st = (uint8_t)r_st;
+            uint8_t n_proc = (uint8_t)r_proc;
             uint8_t n_traj = (v[2] == "1" || v[2] == "true") ? 1u : 0u;
-            uint32_t n_err = (uint32_t)std::strtoul(v[3].c_str(), nullptr, 0);
+            uint32_t n_err = r_err;
 
             if (log_sink() && log_enabled_) {
                 std::string msg;

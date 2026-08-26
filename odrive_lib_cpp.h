@@ -21,7 +21,8 @@ namespace odrive {
 enum class Status {
     Ok = 0,
     ErrBadArg,
-    ErrNotConnected
+    ErrNotConnected,
+    ErrResyncing /* request refused: bus is realigning replies, retry next poll */
 };
 
 enum class AxisState : uint8_t {
@@ -189,7 +190,8 @@ public:
     /* Fire-and-forget: send one command line, no reply expected. O(1). */
     Status send_line(const std::string &line);
 
-    /* Sends one line and matches the next reply to on_reply (FIFO order). */
+    /* Sends one line and matches the next reply to on_reply (FIFO order).
+     * Returns ErrResyncing (without sending) while the bus is realigning. */
     Status request(const std::string &line, ReplyHandler on_reply);
 
     /* Call once per control-loop iteration: dispatches buffered replies,
@@ -199,6 +201,10 @@ public:
 
     /* How long a request() may go unanswered before poll() drops it (default 200 ms). */
     void set_reply_timeout(int timeout_ms);
+
+    /* True while poll() is discarding lines to realign replies with requests.
+     * Clears itself on the first poll() pass that sees no incoming data. */
+    bool is_resyncing() const;
 
     /* Device-wide system commands -- affect BOTH axes on the board. */
     Status clear_errors();
@@ -221,10 +227,19 @@ private:
     Status send_line_locked(const std::string &line);
 
     SerialWorker &worker_;
-    std::mutex mutex_; /* guards worker_ writes + pending_ + axes_ */
+    mutable std::mutex mutex_; /* guards worker_ writes + pending_ + axes_ + resync state */
     std::deque<Pending> pending_;
     std::vector<Axis *> axes_;
     int reply_timeout_ms_ = 200;
+
+    /* ASCII replies carry no request tag, so pairing is positional: one lost
+     * or unsolicited line would mis-pair every later reply, permanently.
+     * A dropped reply therefore invalidates the whole queue -- clear it and
+     * swallow inbound lines until the port goes quiet, which re-aligns. */
+    bool resyncing_ = false;
+    std::chrono::steady_clock::time_point resync_quiet_since_{};
+    int resync_quiet_ms_ = 50; /* silence that proves nothing is still in flight */
+    size_t max_pending_ = 32;  /* backstop: replies not coming back at all */
 };
 
 using AxisCallback = std::function<void(Axis &)>;
@@ -328,6 +343,11 @@ private:
 
     float turns_per_unit_ = 1.0f; /* signed: motor turns per user unit + inversion */
     bool pos_valid_ = false;      /* set once a request_encoder() reply is dispatched */
+
+    /* Heartbeat samples that failed the plausibility check (mis-paired reply);
+     * edge-logged so a desync reports twice, not once per poll. */
+    bool hb_rejecting_ = false;
+    uint32_t hb_rejected_ = 0;
 
     float default_vel_limit_ = 0.0f;
     float default_accel_     = 0.0f;
