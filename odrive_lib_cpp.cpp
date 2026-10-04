@@ -489,9 +489,8 @@ Status Axis::set_input_torque(float torque)
 Status Axis::set_absolute_position(float pos)
 {
     logf("absolute_position %.3f", pos);
-    return write_property(prefix() + "pos_estimate ",
-                           format_float(pos));
-    // return bus_.send_line(build_cmd("es", axis_index_, { pos }));
+    return write_property(prefix() + "pos_estimate",
+                           format_float(pos * turns_per_unit_));
 }
 
 Status Axis::set_relative_pos(float delta)
@@ -552,6 +551,13 @@ Status Axis::set_traj_accel_limits(float accel, float decel)
     Status s2 = write_property(prefix() + "trap_traj.config.decel_limit",
                                 format_float(std::fabs(decel * turns_per_unit_)));
     return (s1 != Status::Ok) ? s1 : s2;
+}
+
+Status Axis::set_vel_ramp_rate(float accel)
+{
+    logf("vel_ramp_rate %.3f", accel);
+    return write_property(prefix() + "controller.config.vel_ramp_rate",
+                           format_float(std::fabs(accel * turns_per_unit_)));
 }
 
 Status Axis::set_defaults(float vel_limit, float accel, float decel)
@@ -774,34 +780,22 @@ Status Axis::poll_heartbeat()
             uint8_t n_st = (uint8_t)st32;
             uint8_t n_proc = (uint8_t)proc32;
 
-            if (log_sink() && log_enabled_) {
-                std::string msg;
-                if (n_st != feedback.hb.axis_state) {
-                    msg += (msg.empty() ? "" : " ");
-                    msg += "axis_state changed: " + std::string(axis_state_str(feedback.hb.axis_state))
-                         + " -> " + std::string(axis_state_str(n_st));
-                }
-                if (n_proc != feedback.hb.procedure_result) {
-                    msg += (msg.empty() ? "" : " ");
-                    msg += "procedure_result=" + std::string(procedure_result_str(n_proc)) + "(" + std::to_string(n_proc) + ")";
-                }
-                if (n_err != feedback.hb.axis_error) {
-                    char eb[96];
-                    error_str(n_err, eb, sizeof eb);
-                    msg += (msg.empty() ? "" : " ");
-                    msg += "axis_error=" + std::string(eb);
-                }
-                if (n_traj != feedback.hb.trajectory_done_flag) {
-                    msg += (msg.empty() ? "" : " ");
-                    msg += "trajectory_done=" + std::to_string(n_traj);
-                }
-                if (!msg.empty()) logf("%s", msg.c_str());
-            }
+            const bool changed = n_st != feedback.hb.axis_state ||
+                                 n_proc != feedback.hb.procedure_result ||
+                                 n_err != feedback.hb.axis_error ||
+                                 n_traj != feedback.hb.trajectory_done_flag;
 
             feedback.hb.axis_state = n_st;
             feedback.hb.procedure_result = n_proc;
             feedback.hb.trajectory_done_flag = n_traj;
             feedback.hb.axis_error = n_err;
+
+            /* any heartbeat field changed -> print the whole heartbeat */
+            if (changed && log_sink() && log_enabled_) {
+                char hb_buf[256];
+                heartbeat_str(feedback.hb, hb_buf, sizeof hb_buf);
+                logf("heartbeat changed: %s", hb_buf);
+            }
 
             if (cb_heartbeat_) cb_heartbeat_(*this);
         });

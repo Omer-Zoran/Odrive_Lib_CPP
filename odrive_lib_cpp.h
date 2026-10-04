@@ -309,6 +309,8 @@ public:
     Status set_limits(float vel_limit, float current_limit);
     Status set_traj_vel_limit(float vel_limit);
     Status set_traj_accel_limits(float accel, float decel);
+    /* Acceleration used by InputMode::VelRamp (controller.config.vel_ramp_rate). */
+    Status set_vel_ramp_rate(float accel);
     Status set_defaults(float vel_limit, float accel, float decel);
     Status restore_defaults();
     Status clear_errors();  /* forwards to Bus -- affects both axes */
